@@ -1,0 +1,111 @@
+#!/bin/bash
+#
+# chkconfig: 2345 20 80
+#
+
+# See https://blog.hazrulnizam.com/create-init-script-centos-6/ for examples
+
+# Source function library.
+. /etc/init.d/functions
+
+RETVAL=0
+prog="iwatch"
+lockfile=/var/lock/subsys/$prog
+
+# Some functions to make the below more readable
+IWATCH=/usr/local/bin/iwatch
+IWATCH_PID=/var/run/iwatch.pid
+IWATCH_CONF=/etc/iwatch/iwatch.xml
+OPTIONS="-d -f $IWATCH_CONF -p $IWATCH_PID"
+
+start() {
+	echo -n "Starting $prog: "
+	$IWATCH $OPTIONS && success || failure
+  RETVAL=$?
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	echo
+	return $RETVAL
+}
+
+stop() {
+  echo -n $"Stopping $prog: "
+	killproc -p $IWATCH_PID $IWATCH
+	RETVAL=$?
+	# if we are in halt or reboot runlevel kill all running sessions
+	# so the TCP connections are closed cleanly
+	if [ "x$runlevel" = x0 -o "x$runlevel" = x6 ] ; then
+	    trap '' TERM
+	    killall $prog 2>/dev/null
+	    trap TERM
+	fi
+	[ $RETVAL -eq 0 ] && rm -f $lockfile
+	echo
+}
+
+reload()
+{
+	echo -n $"Reloading $prog: "
+	killproc -p $IWATCH_PID $IWATCH -HUP
+	RETVAL=$?
+	echo
+}
+
+restart() {
+	stop
+	start
+}
+
+force_reload() {
+	restart
+}
+
+rh_status() {
+	status -p $IWATCH_PID $IWATCH
+}
+
+rh_status_q() {
+	rh_status >/dev/null 2>&1
+}
+
+case "$1" in
+    start)
+  rh_status_q && exit 0
+	start
+	;;
+    stop)
+  if ! rh_status_q; then
+    rm -f $lockfile
+    exit 0
+  fi
+	stop
+	;;
+    status)
+  rh_status
+  RETVAL=$?
+  # if [ $RETVAL -eq 3 -a -f $lockfile ] ; then
+  #   RETVAL=2
+  # fi
+	;;
+    restart)
+  restart
+	;;
+    reload)
+  rh_status_q || exit 7
+  reload
+	;;
+  #   condrestart)
+  #   	<Restarts the servce if it is already running. For example:>
+	# [ -f /var/lock/subsys/<service> ] && restart || :
+  #   probe)
+	# <optional.  If it exists, then it should determine whether
+	# or not the service needs to be restarted or reloaded (or
+	# whatever) in order to activate any changes in the configuration
+	# scripts.  It should print out a list of commands to give to
+	# $0; see the description under the probe tag below.>
+	# ;;
+    *)
+	echo "Usage: iwatch {start|stop|status|reload|restart[|probe]"
+	exit 1
+	;;
+esac
+exit $?

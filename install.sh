@@ -31,3 +31,4 @@ if [ -n "$HASPRG" ]; then echo 'You already have an iwatch program!'; echo "- in
 if [ ! -d /etc/iwatch ]; then mkdir /etc/iwatch || exit 1; fi
 cp iwatch.dtd iwatch.xml.example /etc/iwatch/
 cp iwatch /usr/local/bin/
+cp init.d/iwatch /etc/init.d/
