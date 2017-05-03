@@ -1,13 +1,13 @@
-#!/usr/bin/perl -T
+#!/usr/bin/perl
 # iWatch
 # By Cahya Wirawan <cahya at gmx dot at>
-# Usage in daemon mode: 
+# Usage in daemon mode:
 # iwatch [-f <configfile.xml>] [-d] [-v] [-p <pid file>]
 # Usage in command line mode:
 # iwatch [-c command] [-e event[,event[,..]]] [-m email] [-r] [-t filter] [-x exception] <target>
 # iWatch monitor any changes in directories/files specified
 # in the configuration file, and send email alert.
-# This program needs inotify in linux kernel >= 2.6.13  
+# This program needs inotify in linux kernel >= 2.6.13
 
 use strict;
 use Getopt::Std;
@@ -19,6 +19,7 @@ use Sys::Hostname;
 use XML::SimpleObject::LibXML;
 use POSIX;
 use Sys::Syslog;
+use Data::Dumper;
 
 my $PROGRAM = "iWatch";
 my $VERSION = "0.2.2";
@@ -34,15 +35,23 @@ sub mywatch;
 sub pathwatch;
 sub getMask;
 sub stringf($%);
+sub emailCollect;
+sub emailSend;
 $Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+# in order to collect emails
+my $emails = {};
+
+# search for inotify events every $interval seconds
+my $interval = 60 * 60 * 4; # every 4 hours
 
 my %options=();
 my %formats = (
   'p' => sub { "$PROGRAM" },
   'v' => sub { "$VERSION" },
-  'f' => sub { 
-    $iwatch{'events'}{'Filename'} =~ s/([;<>\*\|`&\$!#\(\)\[\]\{\}:'" \\])/\\$1/g; 
-    "$iwatch{'events'}{'Filename'}"; 
+  'f' => sub {
+    $iwatch{'events'}{'Filename'} =~ s/([;<>\*\|`&\$!#\(\)\[\]\{\}:'" \\])/\\$1/g;
+    "$iwatch{'events'}{'Filename'}";
   },
   'F' => sub {
         return if($iwatch{'events'}{'Name'} !~ /MOVED_TO/ );
@@ -91,7 +100,7 @@ openlog("$PROGRAM", 'cons,pid', 'user');
 $CONFIGFILE = $options{f} if(defined $options{f});
 if($options{p}) {
   #foo the taint mode, if the admin wants crazy filenames, so let him
-  $options{p} =~ /(.*)/; 
+  $options{p} =~ /(.*)/;
   $PIDFILE = $1;
 }
 
@@ -99,8 +108,8 @@ $VERBOSE += 2 if defined $options{v};
 delete @ENV{qw(ENV IFS CDPATH)};
 $ENV{PATH} = "/bin:/usr/bin:/usr/sbin";
 
-if((defined $options{d} || defined $options{f} || defined $options{p}) && 
-   (-e $ARGV[0] || defined $options{c} || defined $options{C} || defined $options{e} || defined $options{m} 
+if((defined $options{d} || defined $options{f} || defined $options{p}) &&
+   (-e $ARGV[0] || defined $options{c} || defined $options{C} || defined $options{e} || defined $options{m}
      || defined $options{r} || defined $options{s} || defined $options{t} || defined $options{w} || defined $options{x} | defined $options{X})) {
      print STDERR "Options [d|f|p] and [c|e|m|r|s|w|x] are mutually exlusive, you can't mix it!\n";
      Usage();
@@ -113,7 +122,7 @@ if(defined $options{w} || -e $ARGV[0]) {
   my $xmlstr = "<config charset=\"" . ((defined $options{C}) ? $options{C} : $CHARSET) . "\">\n";
   $xmlstr .= "  <guard email=\"" . "$user\@localhost\"/>\n";
   $xmlstr .= "  <watchlist>\n";
-  $xmlstr .= "    <contactpoint email=\"" . ((defined $options{m})? $options{m} : 
+  $xmlstr .= "    <contactpoint email=\"" . ((defined $options{m})? $options{m} :
     "$user\@localhost") . "\"/>\n";
   $xmlstr .= "    <path ";
   $xmlstr .= "type=\"" . ((defined $options{r}) ? "recursive" : "single") . "\" ";
@@ -143,8 +152,8 @@ if(defined $options{d}) {
 
   if($ChildPid) {
     open(FH, '>', "$PIDFILE") or die "Could not write to pidfile \"$PIDFILE\": $!";
-    print FH "$ChildPid"; 
-    close FH; 
+    print FH "$ChildPid";
+    close FH;
   }
 
   die "Can't fork: $!\n" if(!defined $ChildPid);
@@ -159,6 +168,9 @@ if(defined $options{d}) {
 }
 
 my $inotify = new Linux::Inotify2;
+# Non blocking $inotify: http://www.perlmonks.org/?node_id=859287
+# Is useful to read all inotify events at every interval time
+$inotify->blocking(0);
 
 Event->signal (signal => 'HUP', cb => sub {
   my $xmlobj = getXmlObject($CONFIGFILE);
@@ -171,8 +183,11 @@ Event->signal (signal => 'HUP', cb => sub {
   if(!(defined $options{w} || -e $ARGV[0]));
 
 %iwatch = xmlDispatch($xmlobj);
-Event->io (fd => $inotify->fileno, poll => 'r', cb => sub { $inotify->poll });
-Event::loop;
+# Using Event->timer to $inotify->poll every $interval time. If no event is recorded,
+# no mail is generate
+Event->timer (fd => $inotify->fileno, poll => 'r', cb => sub { $inotify->poll; emailSend(); },
+  interval => $interval);
+Event::loop();
 
 sub getXmlObject {
   my ($configFile) = @_;
@@ -214,10 +229,10 @@ sub xmlDispatch {
       next if($path->attribute("type") eq "exception" ||
         $path->attribute("type") eq "regexception");
       if(-d $path->value) { $_ = $path->value; s/(.+)\/$/$1/; $path->value($_);}
-      $WatchList{$path->attribute("type")}{$path->value}{"contactpoint"} = 
+      $WatchList{$path->attribute("type")}{$path->value}{"contactpoint"} =
         $watchlist->child("contactpoint")->attribute("email") if(defined($watchlist->child("contactpoint")));
       $WatchList{$path->attribute("type")}{$path->value}{"exec"} = $path->attribute("exec") if(defined($path->attribute("exec")));
-      $WatchList{$path->attribute("type")}{$path->value}{"alert"} = 
+      $WatchList{$path->attribute("type")}{$path->value}{"alert"} =
         (defined($path->attribute("alert")) && $path->attribute("alert") eq "off") ? 0:1;
       $WatchList{$path->attribute("type")}{$path->value}{"type"} = $path->attribute("type");
       $WatchList{$path->attribute("type")}{$path->value}{"syslog"} =
@@ -228,7 +243,7 @@ sub xmlDispatch {
       $mask = (defined($path->attribute("events")))? getMask($path->attribute("events")) : $InotifyEvents{'default'};
       $WatchList{$path->attribute("type")}{$path->value}{"mask"} = $mask;
       $mask |= $InotifyEvents{'create'} if($path->attribute("type") eq "recursive") . "\n";
-      pathwatch($path->attribute("type"), $path->value, %WatchList); 
+      pathwatch($path->attribute("type"), $path->value, %WatchList);
     }
   }
   $Mail{From} = $xmlobj->child("config")->child("guard")->attribute("email");
@@ -236,7 +251,7 @@ sub xmlDispatch {
     if(defined $iwatch{"charset"});
   %{$iwatch{"mail"}} = %Mail;
   %{$iwatch{"watchlist"}} = %WatchList;
-  return %iwatch;  
+  return %iwatch;
 }
 
 sub getMask {
@@ -328,6 +343,42 @@ sub getWatchList {
     return undef: return $rv;
 }
 
+# get all emails for each events and collect them into %$emails hash
+sub emailCollect {
+  my %email = %{shift(@_)};
+
+  # verifying destinations
+  my $To = $email{"To"};
+
+  if (exists ${$emails}{$To}) {
+    push(@{$emails->{$To}}, \%email);
+  } else {
+    ${$emails}{$To} = [];
+    push(@{$emails->{$To}}, \%email);
+  }
+}
+
+# this fuction is called after $inotify->poll; for each recipients get all emails
+# and send only one email
+sub emailSend {
+  # work for each keys
+  foreach my $To (keys %{$emails}){
+    # get first mail
+    my %finalMail = %{shift(@{$emails->{$To}})};
+
+    # change Subject
+    $finalMail{"Subject"} = "iWatch events for $To";
+    foreach my $mail (@{$emails->{$To}}) {
+      $finalMail{"Message"} .= $$mail{"Message"}
+    }
+    # send mail
+    sendmail(%finalMail) or warn $Mail::Sendmail::error;
+  }
+
+  # reset emails
+  $emails = {};
+}
+
 sub mywatch {
   my $e = shift;
   my $Message;
@@ -339,7 +390,7 @@ sub mywatch {
   return if(defined $WatchList{"exception"}{$Filename});
   my $Path = getWatchList($e->{w}->{name}, $e->{name}, %WatchList);
   return if(!defined($Path));
-  
+
   my $now = POSIX::strftime "%e/%b/%Y %H:%M:%S", localtime;
   $iwatch{'events'}{'Name'} = "";
   $mask = $e->mask;
@@ -369,14 +420,14 @@ sub mywatch {
   if($e->IN_CLOSE_WRITE && -f $Filename) {
     $localMessage = "* $Filename is closed\n";
     $Message = "$Message\n$localMessage";
-    $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $Filename is changed";  
+    $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $Filename is changed";
     print STDERR "[$now] $localMessage" if($VERBOSE>0);
     syslog("info","$localMessage") if($Path->{'syslog'});
   }
   elsif($e->IN_DELETE) {
     $localMessage = "* $Filename is deleted\n";
     $Message = "$Message\n$localMessage";
-    $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $Filename is deleted";  
+    $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $Filename is deleted";
     print STDERR "[$now] $localMessage" if($VERBOSE>0);
     syslog("info","$localMessage") if($Path->{'syslog'});
   }
@@ -388,7 +439,7 @@ sub mywatch {
       my $FileMove = $iwatch{'events'}{$e->{cookie}} . ":$Filename";
       $localMessage = "* $iwatch{'events'}{$e->{cookie}} is moved to $Filename\n";
       $Message = "$Message\n$localMessage";
-      $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $iwatch{'events'}{$e->{cookie}} is moved to $Filename";  
+      $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $iwatch{'events'}{$e->{cookie}} is moved to $Filename";
       print STDERR "[$now] $localMessage" if($VERBOSE>0);
       syslog("info","$localMessage") if($Path->{'syslog'});
       $iwatch{'events'}{'OldFilename'} = $iwatch{'events'}{$e->{cookie}};
@@ -403,7 +454,7 @@ sub mywatch {
   elsif($e->IN_DELETE_SELF && -f $Filename && defined $WatchList{$Filename}) {
     $localMessage = "* $Filename is replaced but watched again\n";
     $Message = "$Message\n$localMessage";
-    $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $Filename is replaced";  
+    $Mail{Subject} = "[$PROGRAM] " . hostname() . ": $Filename is replaced";
     print STDERR "[$now] $localMessage" if($VERBOSE>0);
     syslog("info","$localMessage") if($Path->{'syslog'});
     $inotify->watch ("$Filename", $Path->{'mask'}, \&mywatch);
@@ -423,7 +474,10 @@ sub mywatch {
     $Mail{To} = $Path->{'contactpoint'};
     print STDERR "[$now] * Send email to $Mail{To}\n" if($VERBOSE>0);
     syslog("info","* Send email to $Mail{To}") if($Path->{'syslog'});
-    sendmail(%Mail) or warn $Mail::Sendmail::error;
+    #sendmail(%Mail) or warn $Mail::Sendmail::error;
+    #print Dumper(%Mail);
+    # collect email
+    emailCollect(\%Mail);
   }
 }
 
@@ -433,7 +487,7 @@ sub stringf($%) {
   $string =~ s/$re/_stringf($&, \%format)/ge;
   $string;
 }
- 
+
 sub _stringf {
   my ($s,$f) = @_;
   $s =~ s/^\%//;
@@ -452,7 +506,7 @@ sub VERSION_MESSAGE {
 
 sub HELP_MESSAGE {
   print <<ENDOFHELP;
-  
+
 In the daemon mode, $PROGRAM has following options:
 Usage: iwatch [-d] [-f <config file>] [-v] [-p <pid file>]
   -d Execute the application as daemon.
@@ -463,7 +517,7 @@ Usage: iwatch [-d] [-f <config file>] [-v] [-p <pid file>]
   -v Verbose mode.
 
 And in the command line mode:
-Usage: iwatch [-c command] [-C charset] [-e event[,event[,..]]] [-h|--help] [-m <email address>] 
+Usage: iwatch [-c command] [-C charset] [-e event[,event[,..]]] [-h|--help] [-m <email address>]
          [-r] [-s <on|off>] [-t <filter string>] [-v] [--version] [-x exception]
          [-X <regex string as exception>] <target>
 
@@ -509,7 +563,7 @@ Usage: iwatch [-c command] [-C charset] [-e event[,event[,..]]] [-h|--help] [-m 
   -s <on|off>
      Enable or disable reports to the syslog (default is off/disabled)
   -t <filter string>
-     Specify a filter string (regex) to compare with the filename or directory name. 
+     Specify a filter string (regex) to compare with the filename or directory name.
   -v verbose mode.
   --version
      Print the version number.
